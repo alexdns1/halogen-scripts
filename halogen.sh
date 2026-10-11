@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 # halogen.sh — run latest halogen-flash-server, prune old images
+# To allow this specific command to run without a password while
+# keeping password prompts for all other sudo commands, you need
+# to add a highly specific rule to your sudoers configuration.
+# ```bash
+# sudo visudo -f /etc/sudoers.d/compact_memory
+# ```
+# your_username ALL=(root) NOPASSWD: /usr/sbin/sysctl -q vm.compact_memory=1
 #
+# sudo -k
+#
+# sudo /usr/sbin/sysctl -q vm.compact_memory=1
 set -euo pipefail
 
 REGISTRY="ghcr.io"
@@ -9,6 +19,7 @@ IMAGE="${REGISTRY}/${REPO}"
 MODEL_DIR="/mnt/data/models/halogen-qwen3.8-flash-next"
 CACHE_DIR="/mnt/data/halogen-cache"
 PORT=8731
+HOST=0.0.0.0
 KEEP_TAGS="${KEEP_TAGS:-0.15.3}"
 XRT_LIB_DIR="${XRT_LIB_DIR:-/usr/lib/x86_64-linux-gnu}"
 
@@ -145,7 +156,7 @@ optimal_env() {
     -e HALOGEN_TEMPERATURE=1.0 \
     -e HALOGEN_MAX_TOKENS_DEFAULT=16384 \
     -e HALOGEN_MAX_TOKENS_CAP=32768 \
-    -e HALOGEN_REASONING_EFFORT=xhigh \
+    -e HALOGEN_REASONING_EFFORT=medium \
     -e HALOGEN_MAX_THINKING_TOKENS=8192 \
     -e HALOGEN_ENGINE_WATCHDOG_S=0 \
     -e HALOGEN_CACHE_DIR=/cache \
@@ -162,30 +173,42 @@ run_optimal() {
 }
 
 run_optimal_slots8() {
-  mkdir -p "${CACHE_DIR}-s8"
+  mkdir -p "${CACHE_DIR}"
   mapfile -t env_args < <(optimal_env 786432)
-  run "$1" -v "${CACHE_DIR}-s8:/cache" "${env_args[@]}" \
+  run "$1" -v "${CACHE_DIR}:/cache" "${env_args[@]}" \
     -e HALOGEN_KV_SLOTS=8
 }
 
+# -e HALOGEN_SCHEMA_ESCAPE=off
 run_optimal_vision() {
   mkdir -p "${CACHE_DIR}"
-  mapfile -t env_args < <(optimal_env 524288)
+  mapfile -t env_args < <(optimal_env 786432)
   run "$1" -v "${CACHE_DIR}:/cache" "${env_args[@]}" \
     -e HALOGEN_VISION_TOWER=1 \
     -e HALOGEN_VISION_MAX_PIXELS=2073600
 }
 
 run_swift_abliterated() {
-  mkdir -p "${CACHE_DIR}-abl"
-  mapfile -t env_args < <(optimal_env 524288)
-  run "$1" -v "${CACHE_DIR}-abl:/cache" "${env_args[@]}" \
-    -e HALOGEN_CHECKPOINT=/models/qwen38-flash-next-v2-swift15-abliterated.hgn \
+  mkdir -p "${CACHE_DIR}"
+  mapfile -t env_args < <(optimal_env 786432)
+  run "$1" -v "${CACHE_DIR}:/cache" "${env_args[@]}" \
+    -e HALOGEN_CHECKPOINT=/models/qwen38-flash-next-v2-abliterated.hgn \
     -e HALOGEN_NGRAM_TABLE=/models/qwen38-flash-next-ngram.hgn \
     -e HALOGEN_MODEL_ID=halogen-qwen3.8-flash-next \
-    -e HALOGEN_TOP_P=0.95 \
-    -e HALOGEN_TOP_K=20 \
     -e HALOGEN_VISION_TOWER=1 \
+    -e HALOGEN_VISION_MAX_PIXELS=2073600
+}
+
+run_blackfrost() {
+  mkdir -p "${CACHE_DIR}"
+  mapfile -t env_args < <(optimal_env 786432)
+  run "$1" -v "${CACHE_DIR}:/cache" "${env_args[@]}" \
+    -e HALOGEN_CHECKPOINT=/models/blackfrost/model.hgn \
+    -e HALOGEN_NGRAM_TABLE=/models/blackfrost/qwen38-flash-next-ngram.hgn \
+    -e HALOGEN_VISION_TOWER=/models/blackfrost/qwen38-flash-next-vision.hgn \
+    -e HALOGEN_TOKENIZER=/models/blackfrost/tokenizer \
+    -e HALOGEN_MODEL_ID=halogen-qwen3.8-flash-next \
+    -e HALOGEN_TEMPLATE_UNCHECKED=1 \
     -e HALOGEN_VISION_MAX_PIXELS=2073600
 }
 
@@ -205,19 +228,19 @@ run_optimal_npu() {
 }
 
 run_optimal_ht43() {
-  mkdir -p "${CACHE_DIR}-ht43"
+  mkdir -p "${CACHE_DIR}"
   mapfile -t env_args < <(optimal_env 786432)
-  run "$1" -v "${CACHE_DIR}-ht43:/cache" "${env_args[@]}" \
+  run "$1" -v "${CACHE_DIR}:/cache" "${env_args[@]}" \
     -e HALOGEN_CHECKPOINT=/models/qwen38-flash-next-ht43.hgn
 }
 
 run_optimal_npu_ht43() {
-  mkdir -p "${CACHE_DIR}-ht43"
+  mkdir -p "${CACHE_DIR}"
   require_npu
   mapfile -t env_args < <(optimal_env 786432)
   mapfile -t xrt_args < <(xrt_mounts) || exit 1
   run "$1" \
-    -v "${CACHE_DIR}-ht43:/cache" \
+    -v "${CACHE_DIR}:/cache" \
     --device /dev/accel/accel0 \
     "${xrt_args[@]}" \
     "${env_args[@]}" \
@@ -246,6 +269,9 @@ case "${1:-run}" in
   run-swift-abliterated)
     tag=$(resolve); echo "using ${IMAGE}:${tag} (swift abliterated)" >&2; clean "$tag"
     run_swift_abliterated "$tag" ;;
+  run-blackfrost)
+    tag=$(resolve); echo "using ${IMAGE}:${tag} (blackfrost)" >&2; clean "$tag"
+    run_blackfrost "$tag" ;;
   run-optimal-npu)
     tag=$(resolve); echo "using ${IMAGE}:${tag} (optimal + npu)" >&2; clean "$tag"
     run_optimal_npu "$tag" ;;
@@ -257,5 +283,5 @@ case "${1:-run}" in
     run_optimal_npu_ht43 "$tag" ;;
   clean)  tag=$(resolve); clean "$tag" ;;
   latest) resolve ;;
-  *)      echo "usage: $0 [run|run-optimal|run-optimal-slots8|run-optimal-vision|run-optimal-npu|run-optimal-ht43|run-optimal-npu-ht43|run-swift-abliterated|clean|latest]   (VERSION=x.y.z to pin)" >&2; exit 1 ;;
+  *)      echo "usage: $0 [run|run-optimal|run-optimal-slots8|run-optimal-vision|run-optimal-npu|run-optimal-ht43|run-optimal-npu-ht43|run-swift-abliterated|run-blackfrost|clean|latest]   (VERSION=x.y.z to pin)" >&2; exit 1 ;;
 esac
