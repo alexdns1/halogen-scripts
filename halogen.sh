@@ -188,7 +188,15 @@ run_optimal_vision() {
     -e HALOGEN_VISION_MAX_PIXELS=2073600
 }
 
-run_swift_abliterated() {
+run_optimal_fork() {
+  mkdir -p "${CACHE_DIR}-fork"
+  mapfile -t env_args < <(optimal_env 786432)
+  run "$1" -v "${CACHE_DIR}-fork:/cache" "${env_args[@]}" \
+    -e HALOGEN_FORK=1 \
+    -e HALOGEN_FORK_MAP=claude-code
+}
+
+run_abliterated() {
   mkdir -p "${CACHE_DIR}"
   mapfile -t env_args < <(optimal_env 786432)
   run "$1" -v "${CACHE_DIR}:/cache" "${env_args[@]}" \
@@ -266,9 +274,12 @@ case "${1:-run}" in
   run-optimal-vision)
     tag=$(resolve); echo "using ${IMAGE}:${tag} (optimal + vision)" >&2; clean "$tag"
     run_optimal_vision "$tag" ;;
-  run-swift-abliterated)
-    tag=$(resolve); echo "using ${IMAGE}:${tag} (swift abliterated)" >&2; clean "$tag"
-    run_swift_abliterated "$tag" ;;
+  run-optimal-fork)
+    tag=$(resolve); echo "using ${IMAGE}:${tag} (optimal fork)" >&2; clean "$tag"
+    run_optimal_fork "$tag" ;;
+  run-abliterated)
+    tag=$(resolve); echo "using ${IMAGE}:${tag} (abliterated)" >&2; clean "$tag"
+    run_abliterated "$tag" ;;
   run-blackfrost)
     tag=$(resolve); echo "using ${IMAGE}:${tag} (blackfrost)" >&2; clean "$tag"
     run_blackfrost "$tag" ;;
@@ -283,5 +294,5 @@ case "${1:-run}" in
     run_optimal_npu_ht43 "$tag" ;;
   clean)  tag=$(resolve); clean "$tag" ;;
   latest) resolve ;;
-  *)      echo "usage: $0 [run|run-optimal|run-optimal-slots8|run-optimal-vision|run-optimal-npu|run-optimal-ht43|run-optimal-npu-ht43|run-swift-abliterated|run-blackfrost|clean|latest]   (VERSION=x.y.z to pin)" >&2; exit 1 ;;
+  *)      echo "usage: $0 [run|run-optimal|run-optimal-slots8|run-optimal-vision|run-optimal-fork|run-optimal-npu|run-optimal-ht43|run-optimal-npu-ht43|run-abliterated|run-blackfrost|clean|latest]   (VERSION=x.y.z to pin)" >&2; exit 1 ;;
 esac

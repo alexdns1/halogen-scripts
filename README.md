@@ -37,19 +37,22 @@ claude
 ```
 usage: ./halogen.sh [run|run-optimal|run-optimal-vision|run-optimal-npu
                     |run-optimal-ht43|run-optimal-npu-ht43|run-optimal-slots8
-                    |run-swift-abliterated|clean|latest]   (VERSION=x.y.z to pin)
+                    |run-optimal-fork|run-abliterated|run-blackfrost|clean|latest]
+                    (VERSION=x.y.z to pin)
 ```
 
 | profile | checkpoint | pool | extras |
 |---|---|---|---|
 | `run` | default | default | nothing tuned |
 | **`run-optimal`** | v2 | 786432 | **the one to use** |
-| `run-optimal-vision` | v2 | 524288 | vision tower, 1080p cap |
+| `run-optimal-vision` | v2 | 786432 | vision tower, 1080p cap |
 | `run-optimal-npu` | v2 | 524288 | vision + 5 NPU models |
 | `run-optimal-ht43` | ht43 | 786432 | the smaller checkpoint |
 | `run-optimal-npu-ht43` | ht43 | 786432 | both |
 | `run-optimal-slots8` | v2 | 786432 | 8 KV slots — for heavy subagent fan-out |
-| `run-swift-abliterated` | abliterated v2 | 524288 | vision |
+| `run-optimal-fork` | v2 | 786432 | Claude Code sessions (0.18.1+), own cache dir — see [Sessions](#sessions-0181-opt-in) |
+| `run-abliterated` | abliterated v2 | 786432 | vision |
+| `run-blackfrost` | blackfrost (own checkpoint, n-gram table, vision tower, tokenizer) | 786432 | served as `halogen-qwen3.8-flash-next`; the chat-template probe is bypassed (`HALOGEN_TEMPLATE_UNCHECKED=1`), so check `/health.chat_template` — thinking controls may not apply |
 
 The tag is resolved from GHCR each run, falling back to the newest local image if the
 registry is unreachable. `VERSION=0.15.3 ./halogen.sh run-optimal` pins it, and
@@ -79,7 +82,7 @@ magnitude, so it is for correlation after a bad start, not for prediction.
 | `HALOGEN_TEMPERATURE` | `1.0` | the model card's sampling setting; agent harnesses send no sampling fields, so without this every turn runs greedy |
 | `HALOGEN_MAX_TOKENS_DEFAULT` | `16384` | thinking and the answer share one budget |
 | `HALOGEN_MAX_TOKENS_CAP` | `32768` | a request reserves prompt + max_tokens on admission; a huge cap lets one request eat the pool |
-| `HALOGEN_REASONING_EFFORT` | `xhigh` | the card's guidance for multi-turn agentic work |
+| `HALOGEN_REASONING_EFFORT` | `medium` | the template's own default is `xhigh`, which was the model card's guidance for multi-turn agentic work; these profiles send `medium` (shorter thinking). The quality difference has not been measured on this setup. A request's own `reasoning_effort` wins |
 | `HALOGEN_MAX_THINKING_TOKENS` | `8192` | bounds thinking explicitly instead of relying on the answer-room floor |
 | `HALOGEN_ENGINE_WATCHDOG_S` | `0` | **required** given `--rm` with no restart policy — otherwise the watchdog kills the server and nothing brings it back |
 | `HALOGEN_CACHE_DIR` + `DISK_GIB=128` | | prompt cache survives restarts, ~27 KiB/token |
@@ -185,6 +188,62 @@ subagents can; a single stream never will.
 
 ---
 
+## Sessions (0.18.1, opt-in)
+
+A harness that runs several branches from one conversation can ask the server to keep a
+conversation's state under a name and start new requests from it. Halogen documents this as
+request headers: `X-Halogen-Keep: <name>` keeps the state where a reply ends,
+`X-Halogen-From: <name>` starts a request from it, and both together continue from one name
+and keep the result under another (fork and join). Every request stays an ordinary request;
+a server without `HALOGEN_FORK=1` answers it the same way. The `X-Halogen-From` response
+header says `used`, `unmatched` (the history does not repeat the kept one) or `unknown`.
+
+**Claude Code needs none of that.** With `HALOGEN_FORK=1` and `HALOGEN_FORK_MAP=claude-code`
+the server keeps each Claude Code thread's state, the main conversation and every subagent,
+on its own and starts that thread's next request from it. Claude Code sends its own session
+and agent identifiers (`X-Claude-Code-Session-Id`, `-Agent-Id`, `-Parent-Agent-Id`, v2.1.129+),
+which is what the mapping reads. Use the profile:
+
+```bash
+./halogen.sh run-optimal-fork
+```
+
+It uses its own cache directory (`${CACHE_DIR}-fork`). A changed engine configuration changes
+the cache fingerprint (it did for the vision tower, and the fork flag may too), and
+`HALOGEN_CACHE_PRUNE_OLD=1` would then delete the `run-optimal` cache. Names are released after 10 minutes unused, at most 8 live at once
+(`HALOGEN_FORK_TTL_S`, `HALOGEN_FORK_HANDLES`), and survive a restart when
+`HALOGEN_CACHE_DIR` is set.
+
+**Status: not yet measured here.** The behaviour is from the 0.18.1 changelog and README. A
+useful test is a subagent-heavy task with the flag off and on, comparing the cached
+percentage on each subagent's first request in the container log, the `evicted`, `dropped`
+and `entries` counters from `/cache`, and how warm the parent's next turn is. My expectation,
+not a measurement, is that the gain over the automatic prefix cache is modest for Claude Code,
+because subagents mostly share only the system prompt and tool definitions with the parent.
+
+**Security.** Every client of the server shares one set of names, and `GET /halogen/handles`
+lists them. Keep the port private or set `HALOGEN_API_KEY` (and put the key in your
+clients). I have not checked how unguessable Claude Code's session identifiers are, so do not rely on
+that on an open network.
+
+### Other 0.18.1 changes worth knowing
+
+- **Structured output at any temperature.** A JSON schema (`response_format`, `text.format`
+  or `output_config.format`) may now be combined with a temperature above 0, and the reply
+  still validates. A schema with an image, or with `logprobs`, is still a 400.
+- **`prompt_cache_policy: "no_store"`.** A top-level request field that reads the prompt
+  cache but stores nothing, for side requests (a title generator, a summarizer) that share
+  the server with a conversation. Under memory pressure such a request can still make the
+  server forget an idle conversation.
+- **A dropped connection no longer kills a reply.** The server pauses it for 20 seconds
+  (`HALOGEN_RETRY_GRACE_S`, `0` = stop at once); an identical retry continues where it
+  paused. At temperature 0 or with a `seed` the retried reply equals an uninterrupted one.
+- **A long prompt no longer holds up short requests.** A short request arriving while a long
+  prompt is being read runs between two pieces of it, and a request from a person goes ahead
+  of queued agent turns. A reply already streaming still pauses while each piece is read.
+
+---
+
 ## Host configuration
 
 ```
@@ -255,13 +314,21 @@ claude
 ```
 
 Halogen serves the Anthropic Messages API directly, including `/v1/messages/count_tokens`,
-so **no proxy is needed**. LiteLLM works if you want one, but it adds a `response_format`
-conflict — halogen decodes structured output greedily and refuses it under sampling — and
-its token counting falls back to a mismatched tokenizer.
+so **no proxy is needed**. LiteLLM works if you want one, but its token counting falls
+back to a mismatched tokenizer. Before 0.18.1 it also hit a `response_format` conflict,
+because halogen refused structured output under sampling with a 400; from 0.18.1 a JSON
+schema works at any temperature.
 
 The two context variables are the difference between "auto-compaction works" and "the
 session dies with `max_tokens N does not fit`". `CLAUDE_CODE_MAX_CONTEXT_TOKENS` requires
 Claude Code >= 2.1.98.
+
+A current Claude Code asks for its model's full output limit, 128,000 tokens, on every
+request. Through 0.18.0 that was a 400 unless `CLAUDE_CODE_MAX_OUTPUT_TOKENS` was set; from
+0.18.1 `/v1/messages` runs such a request at the server's cap and logs it once. Keep
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS=16384` anyway: it is what keeps a prompt at the compaction
+point plus the output budget inside the 262,144 window. The other routes still refuse a
+`max_tokens` above the cap.
 
 `API_TIMEOUT_MS` matters because a cold 33k prompt takes ~23 s to prefill, and the default
 client timeout hangs up before the first token.
@@ -381,8 +448,9 @@ cd ../proj-refactor && claude-box.sh
 - **`free -g` lies while the server runs.** The kernel counts the pinned weights as
   reclaimable file cache; the startup log says by how much.
 - **Each profile is a different cache fingerprint.** With `CACHE_PRUNE_OLD=1`, switching
-  profiles wipes the other's disk cache — 99 GiB in one case. Use separate `CACHE_DIR`s if
-  you alternate.
+  profiles wipes the other's disk cache — 99 GiB in one case. Every profile in `halogen.sh`
+  shares one `CACHE_DIR` except `run-optimal-fork`, so switching checkpoint prunes the previous
+  cache; give a profile its own directory if you alternate often.
 - **Pin `transformers==4.46.3`** if you use a client that needs it. v5 miscomputes mBART
   position ids and the engine indexes past its positional table.
 - **A short keep-alive breaks agents**, because POST is not idempotent and the client
